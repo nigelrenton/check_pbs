@@ -1,0 +1,199 @@
+#!/bin/python3
+
+import requests
+import argparse
+import json
+from datetime import datetime
+import sys
+
+class Session:
+
+    def __init__(self, parser):
+
+        self.parser = parser
+        self.args = self.__parse_args()
+        with open(self.args.config, 'r') as file:
+             self.config = json.load(file)
+        file.close() 
+        if self.args.ignore_ssl:
+            requests.packages.urllib3.disable_warnings()
+            self.var_verify_requests = False
+        else:
+            self.var_verify_requests = True
+
+    def __parse_args(self):
+
+        self.parser.add_argument("-H", "--host", required=True, help="fqdn or ip address of pbs")
+        self.parser.add_argument("-I", "--ignore_ssl", action="store_true", help="ignore ssl certificate warnings")
+        self.parser.add_argument("-Po", "--port", default="8007", help="port to use if not 8007")
+        self.parser.add_argument("-http", "--http", action="store_true")
+        self.parser.add_argument("-c", "--config", required=True, help="path to config.json")
+        self.parser.add_argument("-d", "--datastore", required=True, help="name of pbs datastore")
+        self.parser.add_argument("-b", "--backups", nargs="+", required=True, help="space seperated list of pbs backup ids to monitor")
+        self.parser.add_argument("-p", "--period", required=True, type=int, help="time period in hours to check for last backup status")
+        self.parser.add_argument("-w", "--warn", action="store_true", help="return warn instead of critical if backup errors are found")
+
+        return self.parser.parse_args()
+
+    def __uri(self):
+
+        uri = "https://"
+        if self.args.http: uri = uri.replace('s','')
+        uri = uri + self.args.host + ":"
+        if self.args.port is not None:
+            uri = uri + self.args.port
+        else:
+            uri = uri + "8007"
+        uri = uri + "/api2/json/admin/datastore/"+ self.args.datastore + "/snapshots"
+
+        return uri        
+
+    def headers(self):
+         
+        return {"Authorization": "PBSAPIToken=" + self.config['token_id'] + ":" + self.config['token']}
+    
+    def uri(self):
+
+        return self.__uri()
+    
+    def datastore(self):
+
+        return self.args.datastore
+
+    def backups(self):
+
+        return self.args.backups
+
+    def period(self):
+
+        return self.args.period
+    
+    def verify_requests(self):
+
+        return self.var_verify_requests
+
+    def warn(self):
+
+        return self.args.warn
+
+class Backups:
+
+    def __init__(self, items, backups,  datastore, period):
+
+        self.items = items
+        self.backups = backups
+        self.datastore = datastore
+        self.period = period
+        self.recents = self.__filter()
+        self.statuses = {}
+        self.__error_check()
+
+    def __filter(self):
+
+        recents = {}
+
+        for item in self.items[self.datastore]:
+
+            if item['backup-id'] not in self.backups:
+            
+                continue
+
+            if item['backup-id'] not in recents:
+
+                recents[item['backup-id']] = item['backup-time']
+            
+            else:
+
+                if item['backup-time'] > recents[item['backup-id']]:
+
+                    recents[item['backup-id']] = item['backup-time']
+
+        return recents
+    
+    def __error_check(self):
+
+        for backup in self.backups:
+
+            if backup not in self.recents:
+
+                self.statuses[backup] = {
+                    "msg": "no backups found",
+                    "error": True,
+                    "value": None
+                }
+
+                continue
+
+            if self.recents[backup] >= datetime.now().timestamp() - self.period * 3600:
+
+                self.statuses[backup] =  {
+                    "msg": "backup ok",
+                    "error": False,
+                    "value": self.recents[backup]
+                }
+
+            else:
+
+                self.statuses[backup] = {
+                    "msg": "last backup not in range: " + datetime.fromtimestamp(self.recents[backup]).isoformat(),
+                    "error": True,
+                    "value": self.recents[backup]
+                }
+
+    def run(self):
+
+        return self.statuses
+
+class Exit:
+
+    def __init__(self, statuses, warn):
+
+        self.statuses = statuses
+        self.warn = 1 if warn else 2
+        self.message = ''
+        self.error = False
+        self.__exit()
+    
+    def __exit(self):
+
+        for backup in self.statuses:
+
+            if self.statuses[backup]['error'] == True:
+
+                self.error = True
+                self.message = self.message + backup + ": " + self.statuses[backup]['msg'] + ", "
+
+        self.message = self.message[:-2]
+
+        if self.error:
+
+            print(self.message)
+
+            sys.exit(self.warn)
+        
+        else:
+
+            self.message = 'BACKUP OK'
+
+            print(self.message)
+
+            sys.exit(0)
+
+def main():
+       
+    session = Session(argparse.ArgumentParser(description='proxmox backup server monitor for nagios core'))
+
+    request = requests.get(
+        session.uri(),
+        headers = session.headers(),
+        verify = session.verify_requests()
+    )
+
+    response = json.loads(request.text) 
+
+    statuses = Backups(response, session.backups(), session.datastore(), session.period()).run()
+    Exit(statuses, session.warn())
+
+if __name__ == '__main__':
+       
+       main()
